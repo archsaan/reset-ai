@@ -18,4 +18,5 @@ typing-inspection==0.4.4
 typing_extensions==4.16.0
 websockets==16.1.1
 xxhash==4.0.1
+uvicorn==0.52.4
 zstandard==0.25.0
