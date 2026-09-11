@@ -1,11 +1,16 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
-import anthropic
 import sqlite3
 import uuid
 import httpx
 from datetime import date, datetime, timedelta
+
+from langchain_anthropic import ChatAnthropic
+from langchain_core.tools import tool
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
+from langgraph.graph import StateGraph, MessagesState, END
+from langgraph.prebuilt import ToolNode
 
 # ---------------------------------------------------------
 # Config
@@ -17,7 +22,7 @@ SCHEDULE_API_KEY = "PASTE_KEY_HERE_IF_NEEDED"  # or None if not required
 DB_FILE = "conversations.db"
 
 # ---------------------------------------------------------
-# Agent identity
+# Agent identity + knowledge base
 # ---------------------------------------------------------
 
 AGENT_IDENTITY = (
@@ -31,100 +36,40 @@ AGENT_IDENTITY = (
     "never on complaints or sensitive topics."
 )
 
-# ---------------------------------------------------------
-# Knowledge base — loaded once at startup from file
-# ---------------------------------------------------------
-
 with open("knowledge_base.md", "r", encoding="utf-8") as f:
     KNOWLEDGE_BASE = f.read()
 
-BASE_SYSTEM_PROMPT = (
-    AGENT_IDENTITY
-    + "\n\n--- KNOWLEDGE BASE ---\n"
-    + KNOWLEDGE_BASE
-    + "\n\n--- RULES ---\n"
-    + "Only answer factual questions (pricing, location, policies, services) using the "
-      "Knowledge Base above. Never guess or invent details not contained in it. "
-      "If the answer isn't in the Knowledge Base, say: 'Our team will have all "
-      "the details and will be in touch with you very shortly! 😊' "
-      "\n\nFor anything related to class times, schedules, or availability on a specific "
-      "date — NEVER use static text, and never guess. Always use the get_schedule or "
-      "check_availability tool instead, since those pull real, live data. The Knowledge "
-      "Base intentionally does not contain a fixed schedule for this reason. "
-      "\n\nUse get_schedule when a lead asks generally what's on or wants to browse classes. "
-      "Use check_availability when a lead names a specific class and wants to know if "
-      "there's space, or wants to book — this tool also checks upcoming days automatically "
-      "if the requested date is full. Each result includes a 'day_label' field — always "
-      "trust and use that label rather than calculating the day yourself. "
-      "Use book_class ONLY after check_availability has confirmed there is space, and only "
-      "once you have the lead's name."
+RULES = (
+    "Only answer factual questions (pricing, location, policies, services) using the "
+    "Knowledge Base above. Never guess or invent details not contained in it. "
+    "If the answer isn't in the Knowledge Base, say: 'Our team will have all "
+    "the details and will be in touch with you very shortly! 😊' "
+    "\n\nFor anything related to class times, schedules, or availability on a specific "
+    "date — NEVER use static text, and never guess. Always use the get_schedule or "
+    "check_availability tool instead, since those pull real, live data. "
+    "\n\nUse get_schedule when a lead asks generally what's on or wants to browse classes. "
+    "Use check_availability when a lead names a specific class and wants to know if "
+    "there's space, or wants to book — this tool also checks upcoming days automatically "
+    "if the requested date is full. Each result includes a 'day_label' field — always "
+    "trust and use that label rather than calculating the day yourself. "
+    "Use book_class ONLY after check_availability has confirmed there is space, and only "
+    "once you have the lead's name. If the requested class/date is full, use "
+    "check_availability's results to offer the nearest real alternative before booking "
+    "anything. You may call multiple tools in sequence within the same turn if needed — "
+    "for example, checking availability and then immediately booking once confirmed."
 )
 
-tools = [
-    {
-        "name": "get_schedule",
-        "description": "Get the full class schedule for Reset Fitness on a given date. Use this when a lead asks generally what's on, or what classes are available on a specific day.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "target_date": {
-                    "type": "string",
-                    "description": "Date in YYYY-MM-DD format. Defaults to today if not specified."
-                }
-            }
-        }
-    },
-    {
-        "name": "check_availability",
-        "description": "Check if a specific class has open spots on a given date, and automatically checks the next few days too if needed. Use this when a lead asks about a specific class by name and wants to know if there's space, especially if they want to book. Each result includes a 'day_label' field — always trust and use this label rather than calculating the day yourself.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "class_name": {
-                    "type": "string",
-                    "description": "The name of the class to check, e.g. 'Firestarter', 'Red Light Treatment'"
-                },
-                "target_date": {
-                    "type": "string",
-                    "description": "Date in YYYY-MM-DD format to start checking from. Defaults to today if not specified."
-                }
-            },
-            "required": ["class_name"]
-        }
-    },
-    {
-        "name": "book_class",
-        "description": "Book a lead into a specific class. Only call this after confirming with check_availability that there is space at the exact date/time. Requires the lead's name.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "class_name": {"type": "string"},
-                "target_date": {"type": "string", "description": "YYYY-MM-DD"},
-                "start_time": {"type": "string", "description": "e.g. '06:30 PM', matching the schedule format exactly"},
-                "lead_name": {"type": "string"}
-            },
-            "required": ["class_name", "target_date", "start_time", "lead_name"]
-        }
-    }
-]
+def build_system_prompt() -> str:
+    today_str = date.today().isoformat()
+    return (
+        AGENT_IDENTITY
+        + "\n\n--- KNOWLEDGE BASE ---\n" + KNOWLEDGE_BASE
+        + "\n\n--- RULES ---\n" + RULES
+        + f"\n\nToday's actual date is {today_str}. Always trust this over any assumption."
+    )
 
 # ---------------------------------------------------------
-# App setup
-# ---------------------------------------------------------
-
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # fine for local dev; restrict this in production
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-client = anthropic.Anthropic()
-
-# ---------------------------------------------------------
-# Database helpers
+# Database helpers (unchanged from before)
 # ---------------------------------------------------------
 
 def init_db():
@@ -150,7 +95,7 @@ def get_history(session_id: str):
         (session_id,)
     ).fetchall()
     conn.close()
-    return [{"role": role, "content": content} for role, content in rows]
+    return rows
 
 def save_message(session_id: str, role: str, content: str):
     conn = sqlite3.connect(DB_FILE)
@@ -162,23 +107,20 @@ def save_message(session_id: str, role: str, content: str):
     conn.close()
 
 # ---------------------------------------------------------
-# Tool 1: get_schedule — full schedule for one day
+# Tools — now defined with LangChain's @tool decorator,
+# which auto-generates the schema Claude needs from the
+# function signature and docstring (no more manual JSON schema)
 # ---------------------------------------------------------
 
-def get_schedule(target_date: str = None):
+def _fetch_schedule(target_date: str = None):
+    """Internal helper — raw schedule fetch, used by all three tools below."""
     if target_date is None:
         target_date = date.today().isoformat()
 
-    payload = {
-        "facility_id": 1,
-        "room_id": "",
-        "date": target_date
-    }
-
+    payload = {"facility_id": 1, "room_id": "", "date": target_date}
     headers = {}
     if SCHEDULE_API_KEY and SCHEDULE_API_KEY != "PASTE_KEY_HERE_IF_NEEDED":
         headers["Authorization"] = f"Bearer {SCHEDULE_API_KEY}"
-        # or headers["x-api-key"] = SCHEDULE_API_KEY — depends on what the API expects
 
     response = httpx.post(SCHEDULE_API_URL, json=payload, headers=headers, timeout=10)
     data = response.json()
@@ -188,31 +130,36 @@ def get_schedule(target_date: str = None):
         capacity = int(cls["capacity"])
         booked = int(cls["booked"])
         cancelled = int(cls.get("cancelled", 0))
-        spots_left = capacity - (booked - cancelled)
-
+        spots_left = max(capacity - (booked - cancelled), 0)
         cleaned.append({
             "class_name": cls["class_name"],
             "discipline": cls["discipline_name"],
             "start_time": cls["start_time"],
             "end_time": cls["end_time"],
             "coach": f'{cls["coach"][0]["firstname"]} {cls["coach"][0]["lastname"]}' if cls.get("coach") else None,
-            "spots_left": max(spots_left, 0),
+            "spots_left": spots_left,
             "class_type": cls["class_type"],
         })
-
     return cleaned
 
-# Temporary debug endpoint — test the schedule API directly, no Claude call, no cost.
-# Remove this before treating the project as "done".
-@app.get("/test-schedule")
-def test_schedule():
-    return get_schedule()
 
-# ---------------------------------------------------------
-# Tool 2: check_availability — one class, across multiple days
-# ---------------------------------------------------------
+@tool
+def get_schedule(target_date: str = None) -> list:
+    """Get the full class schedule for Reset Fitness on a given date.
+    Use this when a lead asks generally what's on, or what classes are
+    available on a specific day. target_date should be in YYYY-MM-DD format;
+    defaults to today if not given."""
+    return _fetch_schedule(target_date)
 
-def check_availability(class_name: str, target_date: str = None, max_days_ahead: int = 3):
+
+@tool
+def check_availability(class_name: str, target_date: str = None, max_days_ahead: int = 3) -> list:
+    """Check if a specific class has open spots on a given date, and
+    automatically checks the next few days too. Use this when a lead names
+    a specific class and wants to know if there's space, or wants to book.
+    Each result includes a 'day_label' field (e.g. 'today', 'tomorrow', or
+    a weekday name) — always trust and use that label rather than
+    calculating the day yourself. target_date defaults to today if not given."""
     if target_date is None:
         target_date = date.today().isoformat()
 
@@ -231,12 +178,8 @@ def check_availability(class_name: str, target_date: str = None, max_days_ahead:
         else:
             day_label = check_date_obj.strftime("%A, %B %d")
 
-        schedule = get_schedule(check_date)
-
-        matches = [
-            cls for cls in schedule
-            if class_name.lower() in cls["class_name"].lower()
-        ]
+        schedule = _fetch_schedule(check_date)
+        matches = [c for c in schedule if class_name.lower() in c["class_name"].lower()]
 
         for cls in matches:
             results.append({
@@ -247,24 +190,20 @@ def check_availability(class_name: str, target_date: str = None, max_days_ahead:
                 "spots_left": cls["spots_left"],
                 "coach": cls["coach"],
             })
-
     return results
 
-# Temporary debug endpoint — test this tool directly, no Claude call, no cost.
-# Remove this before treating the project as "done".
-@app.get("/test-availability")
-def test_availability(class_name: str, target_date: str = None):
-    return check_availability(class_name, target_date)
 
-# ---------------------------------------------------------
-# Tool 3: book_class — MOCK booking, no real API call
-# ---------------------------------------------------------
-
+# Fake in-memory bookings — resets on restart. Mock only, no real write.
 mock_bookings = []
 
-def book_class(class_name: str, target_date: str, start_time: str, lead_name: str):
+@tool
+def book_class(class_name: str, target_date: str, start_time: str, lead_name: str) -> dict:
+    """Book a lead into a specific class. Only call this after
+    check_availability has confirmed there is space at the exact date/time.
+    Requires the lead's name. target_date in YYYY-MM-DD format, start_time
+    matching the schedule format exactly (e.g. '06:30 PM')."""
     matches = [
-        cls for cls in get_schedule(target_date)
+        cls for cls in _fetch_schedule(target_date)
         if class_name.lower() in cls["class_name"].lower()
         and cls["start_time"] == start_time
     ]
@@ -284,84 +223,94 @@ def book_class(class_name: str, target_date: str, start_time: str, lead_name: st
         "booking_id": str(uuid.uuid4())[:8],
     }
     mock_bookings.append(booking)
-
     return {"success": True, "booking": booking}
+
+
+all_tools = [get_schedule, check_availability, book_class]
+
+# ---------------------------------------------------------
+# LangGraph setup
+# ---------------------------------------------------------
+
+model = ChatAnthropic(model="claude-haiku-4-5-20251001", max_tokens=500)
+model_with_tools = model.bind_tools(all_tools)
+
+def agent_node(state: MessagesState):
+    """Calls Claude with the current conversation. Claude decides whether
+    it needs to call a tool or can answer directly."""
+    system_prompt = build_system_prompt()
+    messages = [SystemMessage(content=system_prompt)] + state["messages"]
+    response = model_with_tools.invoke(messages)
+    return {"messages": [response]}
+
+def should_continue(state: MessagesState):
+    """The conditional edge: if the last message has tool calls, go run
+    them. Otherwise, the agent is done — end the graph."""
+    last_message = state["messages"][-1]
+    if getattr(last_message, "tool_calls", None):
+        return "tools"
+    return END
+
+tool_node = ToolNode(all_tools)
+
+graph_builder = StateGraph(MessagesState)
+graph_builder.add_node("agent", agent_node)
+graph_builder.add_node("tools", tool_node)
+graph_builder.set_entry_point("agent")
+graph_builder.add_conditional_edges("agent", should_continue, {"tools": "tools", END: END})
+graph_builder.add_edge("tools", "agent")  # after tools run, loop back to the agent
+
+graph = graph_builder.compile()
+
+# ---------------------------------------------------------
+# App setup
+# ---------------------------------------------------------
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/")
+def read_root():
+    return {"message": "FastAPI is running!"}
 
 @app.get("/test-bookings")
 def test_bookings():
     return mock_bookings
 
 # ---------------------------------------------------------
-# Chat endpoint
+# Chat endpoint — now runs the LangGraph graph instead of
+# manual tool-call handling
 # ---------------------------------------------------------
 
 class ChatRequest(BaseModel):
     session_id: str | None = None
     message: str
 
-@app.get("/")
-def read_root():
-    return {"message": "FastAPI is running!"}
-
 @app.post("/chat")
 def chat(request: ChatRequest):
     session_id = request.session_id or str(uuid.uuid4())
 
     save_message(session_id, "user", request.message)
-    history = get_history(session_id)
-    recent_history = history[-20:]
+    history_rows = get_history(session_id)[-20:]
 
-    today_str = date.today().isoformat()
-    system_prompt = (
-        BASE_SYSTEM_PROMPT
-        + f"\n\nToday's actual date is {today_str}. Always trust this over any "
-          f"assumption about what day it is."
-    )
-
-    response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=300,
-        system=system_prompt,
-        messages=recent_history,
-        tools=tools
-    )
-
-    print("STOP REASON:", response.stop_reason)  # temporary debug line — remove later
-
-    if response.stop_reason == "tool_use":
-        tool_use_block = next(b for b in response.content if b.type == "tool_use")
-        print("TOOL CALLED:", tool_use_block.name, tool_use_block.input)  # temporary debug line
-
-        if tool_use_block.name == "get_schedule":
-            result = get_schedule(tool_use_block.input.get("target_date"))
-        elif tool_use_block.name == "check_availability":
-            result = check_availability(
-                tool_use_block.input["class_name"],
-                tool_use_block.input.get("target_date")
-            )
-        elif tool_use_block.name == "book_class":
-            result = book_class(**tool_use_block.input)
+    # Rebuild LangChain message objects from stored history
+    lc_messages = []
+    for role, content in history_rows:
+        if role == "user":
+            lc_messages.append(HumanMessage(content=content))
         else:
-            result = {"error": "unknown tool"}
+            lc_messages.append(AIMessage(content=content))
 
-        follow_up = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=500,
-            system=system_prompt,
-            messages=recent_history + [
-                {"role": "assistant", "content": response.content},
-                {"role": "user", "content": [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": tool_use_block.id,
-                        "content": str(result)
-                    }
-                ]}
-            ]
-        )
-        reply_text = next(b.text for b in follow_up.content if b.type == "text")
-    else:
-        reply_text = next(b.text for b in response.content if b.type == "text")
+    result = graph.invoke({"messages": lc_messages})
+
+    final_message = result["messages"][-1]
+    reply_text = final_message.content
 
     save_message(session_id, "assistant", reply_text)
 
