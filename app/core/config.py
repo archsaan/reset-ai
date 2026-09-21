@@ -31,8 +31,8 @@ SCHEDULE_API_KEY = "PASTE_KEY_HERE_IF_NEEDED"
 # Until then, app/agent/tools/booking_tools.py falls back to an
 # in-memory mock so the rest of the graph keeps working.
 
-BOOKING_CREATE_API_URL = ""
-BOOKING_CANCEL_API_URL = ""
+BOOKING_VALIDATE_API_URL = "https://crmapi.profitconnect.co/member/booking/validate"
+BOOKING_CREATE_API_URL = "https://crmapi.profitconnect.co/member/booking/book"
 BOOKING_API_KEY = ""
 
 # ---------------------------------------------------------
