@@ -35,6 +35,7 @@ BOOKING_VALIDATE_API_URL = "https://crmapi.profitconnect.co/member/booking/valid
 BOOKING_CREATE_API_URL = "https://crmapi.profitconnect.co/member/booking/book"
 BOOKING_API_KEY = ""
 FACILITY_ID="2"
+TEST_MEMBER_ID="6"
 
 # ---------------------------------------------------------
 # Databases
